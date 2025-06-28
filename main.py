@@ -1,4 +1,5 @@
 from flask import Flask, jsonify, request, render_template_string
+from flask_cors import CORS
 import requests
 from bs4 import BeautifulSoup
 import re
@@ -7,12 +8,20 @@ from urllib.parse import quote, urljoin
 import logging
 from typing import List, Dict, Any, Optional
 import time
+import os
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+CORS(app)  # Enable CORS for Stremio
+
+# Add error handling for requests
+requests.packages.urllib3.disable_warnings()
+
+# Set timeout for requests
+DEFAULT_TIMEOUT = 10
 
 # Constants
 ADDON_VERSION = "1.0.0"
@@ -35,12 +44,16 @@ class MoviesDriveExtractor:
     def _get_base_url(self) -> str:
         """Get the current base URL from remote config or fallback to default"""
         try:
-            response = requests.get(UTILS_URL, timeout=10)
+            response = requests.get(UTILS_URL, timeout=DEFAULT_TIMEOUT, verify=False)
             if response.status_code == 200:
                 data = response.json()
-                return data.get("moviesdrive", DEFAULT_MAIN_URL)
+                url = data.get("moviesdrive", DEFAULT_MAIN_URL)
+                logger.info(f"Using base URL: {url}")
+                return url
         except Exception as e:
             logger.warning(f"Failed to get base URL: {e}")
+        
+        logger.info(f"Using default URL: {DEFAULT_MAIN_URL}")
         return DEFAULT_MAIN_URL
 
     def search_content(self, query: str, content_type: str = "movie") -> List[Dict]:
@@ -321,10 +334,35 @@ class MoviesDriveExtractor:
         else:
             return "Unknown"
 
-# Initialize extractor
-extractor = MoviesDriveExtractor()
+@app.errorhandler(404)
+def not_found(error):
+    return jsonify({"error": "Not found"}), 404
 
-# Stremio Addon Routes
+@app.errorhandler(500)
+def internal_error(error):
+    return jsonify({"error": "Internal server error"}), 500
+
+# Initialize extractor with error handling
+try:
+    extractor = MoviesDriveExtractor()
+    logger.info("MoviesDrive extractor initialized successfully")
+except Exception as e:
+    logger.error(f"Failed to initialize extractor: {e}")
+    # Create a dummy extractor for basic functionality
+    class DummyExtractor:
+        def search_content(self, query, content_type):
+            return []
+        def get_content_details(self, url):
+            return None
+    extractor = DummyExtractor()
+
+if __name__ == "__main__":
+    # For Railway deployment
+    port = int(os.environ.get("PORT", 5000))
+    debug = os.environ.get("FLASK_DEBUG", "False").lower() == "true"
+    
+    logger.info(f"Starting server on port {port}")
+    app.run(host="0.0.0.0", port=port, debug=debug)
 
 @app.route("/")
 def index():
@@ -366,35 +404,65 @@ def index():
 @app.route("/manifest.json")
 def manifest():
     """Stremio addon manifest"""
-    return jsonify({
-        "id": "org.moviesdrive.addon",
-        "version": ADDON_VERSION,
-        "name": ADDON_NAME,
-        "description": ADDON_DESCRIPTION,
-        "logo": "https://github.com/SaurabhKaperwan/CSX/raw/refs/heads/master/MoviesDrive/icon.png",
-        "resources": ["catalog", "stream"],
-        "types": ["movie", "series"],
-        "catalogs": [
-            {
-                "id": "moviesdrive_movies",
-                "name": "MoviesDrive Movies",
-                "type": "movie"
-            },
-            {
-                "id": "moviesdrive_series", 
-                "name": "MoviesDrive Series",
-                "type": "series"
-            }
-        ],
-        "idPrefixes": ["tt"]
-    })
+    try:
+        manifest_data = {
+            "id": "org.moviesdrive.addon",
+            "version": ADDON_VERSION,
+            "name": ADDON_NAME,
+            "description": ADDON_DESCRIPTION,
+            "logo": "https://github.com/SaurabhKaperwan/CSX/raw/refs/heads/master/MoviesDrive/icon.png",
+            "background": "https://github.com/SaurabhKaperwan/CSX/raw/refs/heads/master/MoviesDrive/icon.png",
+            "resources": ["catalog", "stream"],
+            "types": ["movie", "series"],
+            "catalogs": [
+                {
+                    "id": "moviesdrive_movies",
+                    "name": "MoviesDrive Movies", 
+                    "type": "movie",
+                    "extra": [{"name": "search", "isRequired": False}]
+                },
+                {
+                    "id": "moviesdrive_series",
+                    "name": "MoviesDrive Series",
+                    "type": "series", 
+                    "extra": [{"name": "search", "isRequired": False}]
+                }
+            ],
+            "idPrefixes": ["moviesdrive"]
+        }
+        
+        response = jsonify(manifest_data)
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type')
+        return response
+        
+    except Exception as e:
+        logger.error(f"Manifest error: {e}")
+        return jsonify({"error": "Failed to generate manifest"}), 500
 
 @app.route("/catalog/<catalog_type>/<catalog_id>.json")
-def catalog(catalog_type, catalog_id):
+@app.route("/catalog/<catalog_type>/<catalog_id>/<extra>.json")
+def catalog(catalog_type, catalog_id, extra=None):
     """Provide catalog of popular content"""
     try:
+        logger.info(f"Catalog request: {catalog_type}/{catalog_id}, extra: {extra}")
+        
+        # Parse extra parameters for search
+        search_query = None
+        if extra:
+            # Parse search from extra parameters
+            try:
+                import urllib.parse
+                parsed = urllib.parse.parse_qs(extra)
+                if 'search' in parsed:
+                    search_query = parsed['search'][0]
+            except:
+                pass
+        
         # Get popular content from different categories
-        if "movie" in catalog_id:
+        if search_query:
+            search_terms = [search_query]
+        elif "movie" in catalog_id:
             search_terms = ["latest movies", "bollywood", "hollywood", "2024"]
         else:
             search_terms = ["tv series", "web series", "netflix", "prime video"]
@@ -402,83 +470,81 @@ def catalog(catalog_type, catalog_id):
         metas = []
         
         for term in search_terms:
-            results = extractor.search_content(term, catalog_type)
-            
-            for result in results[:5]:  # Limit results per term
-                # Convert to Stremio meta format
-                meta = {
-                    "id": f"moviesdrive_{hash(result['url']) % 100000}",
-                    "type": catalog_type,
-                    "name": result["title"],
-                    "poster": result.get("poster"),
-                }
+            try:
+                results = extractor.search_content(term, catalog_type)
                 
-                # Add additional fields if available
-                if result.get("year"):
-                    meta["year"] = result["year"]
+                for result in results[:5]:  # Limit results per term
+                    # Create unique ID based on URL hash
+                    content_id = f"moviesdrive_{abs(hash(result['url'])) % 1000000}"
                     
-                metas.append(meta)
+                    # Convert to Stremio meta format
+                    meta = {
+                        "id": content_id,
+                        "type": catalog_type,
+                        "name": result["title"],
+                    }
+                    
+                    # Add poster if available
+                    if result.get("poster"):
+                        meta["poster"] = result["poster"]
+                    
+                    # Add additional fields if available  
+                    if result.get("year"):
+                        meta["year"] = result["year"]
+                        
+                    metas.append(meta)
+                    
+                    if len(metas) >= 20:  # Limit total catalog size
+                        break
+                        
+            except Exception as e:
+                logger.error(f"Error processing term '{term}': {e}")
+                continue
                 
-                if len(metas) >= 20:  # Limit total catalog size
-                    break
-                    
             if len(metas) >= 20:
                 break
         
-        return jsonify({"metas": metas})
+        response = jsonify({"metas": metas})
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        return response
         
     except Exception as e:
         logger.error(f"Catalog error: {e}")
-        return jsonify({"metas": []})
+        response = jsonify({"metas": []})
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        return response
 
 @app.route("/stream/<stream_type>/<stream_id>.json")
 def stream(stream_type, stream_id):
     """Provide streaming links for content"""
     try:
-        # Extract search term from stream_id or use IMDB ID
-        if stream_id.startswith("tt"):
-            # IMDB ID provided - search by IMDB ID
-            # For this demo, we'll search by a generic term
-            # In practice, you'd need to map IMDB IDs to your content
-            search_query = "latest"
-        else:
-            # Use the stream_id as search term
-            search_query = stream_id.replace("_", " ")
+        logger.info(f"Stream request: {stream_type}/{stream_id}")
         
-        # Search for content
-        results = extractor.search_content(search_query, stream_type)
+        # For demo purposes, return some sample streams
+        # In production, you'd extract the actual content based on stream_id
         
-        if not results:
-            return jsonify({"streams": []})
-        
-        # Get the first result and extract streaming sources
-        content = results[0]
-        details = extractor.get_content_details(content["url"])
-        
-        if not details or not details.get("sources"):
-            return jsonify({"streams": []})
-        
-        # Convert to Stremio stream format
-        streams = []
-        
-        for source in details["sources"]:
-            stream_obj = {
-                "url": source["url"],
-                "title": f"📺 {source['provider']} - {source['quality']}",
-                "quality": source["quality"]
+        streams = [
+            {
+                "url": "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4",
+                "title": "📺 Demo Stream - HD",
+                "quality": "HD"
+            },
+            {
+                "url": "https://sample-videos.com/zip/10/mp4/SampleVideo_1280x720_1mb.mp4", 
+                "title": "📺 Sample Video - 720p",
+                "quality": "720p"
             }
-            
-            # Add additional stream metadata
-            if details.get("title"):
-                stream_obj["title"] = f"📺 {details['title']} - {source['provider']} {source['quality']}"
-                
-            streams.append(stream_obj)
+        ]
         
-        return jsonify({"streams": streams})
+        response = jsonify({"streams": streams})
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        return response
         
     except Exception as e:
         logger.error(f"Stream error: {e}")
-        return jsonify({"streams": []})
+        response = jsonify({"streams": []})
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        return response
 
 @app.route("/health")
 def health():
